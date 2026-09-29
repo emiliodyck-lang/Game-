@@ -83,6 +83,14 @@
   .overlay h2 { font-family: var(--display); font-weight: 400; font-size: 2.1rem; margin: 0; color: var(--goal); }
   .overlay h2.bad { color: var(--ghost); }
   .overlay p { margin: 0; font-size: .95rem; max-width: 30ch; }
+  .menu h2 { color: var(--trail); }
+  .pick { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  .pick span { font-size: .75rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .seg { display: flex; border: 1.5px solid var(--muted); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 9px 14px; font-size: .9rem; }
+  .seg button + button { border-left: 1.5px solid var(--muted); }
+  .seg button[aria-pressed="true"] { background: var(--goal); color: var(--ink); }
+  .menu .desc { font-size: .8rem; color: var(--muted); min-height: 2.4em; }
   .flash { animation: flash .4s ease-out; }
   @keyframes flash { from { box-shadow: 0 0 0 6px var(--ghost); } to { box-shadow: 0 0 0 0 transparent; } }
   @media (prefers-reduced-motion: reduce) { .flash { animation: none; } }
@@ -105,9 +113,27 @@
       <p id="ovText"></p>
       <button class="primary" id="ovBtn"></button>
     </div>
+    <div class="overlay menu" id="menu">
+      <h2>Maze Trace</h2>
+      <div class="pick">
+        <span>Difficulty</span>
+        <div class="seg" id="diffSeg">
+          <button data-v="easy">Easy</button><button data-v="normal">Normal</button><button data-v="hard">Hard</button>
+        </div>
+      </div>
+      <div class="pick">
+        <span>Maze size</span>
+        <div class="seg" id="sizeSeg">
+          <button data-v="small">Small</button><button data-v="medium">Medium</button><button data-v="large">Large</button>
+        </div>
+      </div>
+      <p class="desc" id="menuDesc"></p>
+      <button class="primary" id="startBtn">Start</button>
+    </div>
   </div>
   <p class="rule" id="rule"></p>
   <div class="controls">
+    <button id="menuBtn">Menu</button>
     <button id="restartBtn">Restart level</button>
     <button id="newBtn">New maze</button>
   </div>
@@ -145,7 +171,40 @@
     { size: 9,  fog: 2.3, keys: 3, msg: 'Find the keys in the dark.' },
     { size: 10, gates: 4, ghosts: 1, loops: .15, msg: 'Gates <strong>and</strong> a ghost.' },
   ];
+  const DIFF = {
+    easy:   { lives: 5, ghostSpeed: 1.15, chase: .15, timer: 1.6, fog: 1, gate: 1.4, extraKeys: 0, extraGhosts: 0,
+              desc: '5 lives. Slow ghosts, more time, bigger light.' },
+    normal: { lives: 3, ghostSpeed: 1.7, chase: .35, timer: 1, fog: 0, gate: 1, extraKeys: 0, extraGhosts: 0,
+              desc: '3 lives. The standard game.' },
+    hard:   { lives: 2, ghostSpeed: 2.3, chase: .6, timer: .75, fog: -.5, gate: .75, extraKeys: 1, extraGhosts: 1,
+              desc: '2 lives. Fast hunting ghosts, extra keys, less time.' },
+  };
+  const SIZES = { small: -2, medium: 0, large: 4 };
+  const SIZE_DESC = { small: 'Quick mazes.', medium: 'Regular mazes.', large: 'Long mazes.' };
+  let settings = { diff: 'normal', size: 'medium' };
+  try { Object.assign(settings, JSON.parse(localStorage.getItem('maze-settings')) || {}); } catch (e) {}
+  if (!DIFF[settings.diff]) settings.diff = 'normal';
+  if (!(settings.size in SIZES)) settings.size = 'medium';
+
+  // Apply the chosen difficulty and size on top of the level's twists
   function levelSpec(l) {
+    const base = baseSpec(l), d = DIFF[settings.diff];
+    const sz = Math.max(5, base.size + SIZES[settings.size]);
+    const grow = sz / base.size;
+    return {
+      ...base,
+      size: sz,
+      keys: base.keys ? base.keys + d.extraKeys + (grow > 1.2 ? 1 : 0) : 0,
+      ghosts: base.ghosts ? base.ghosts + d.extraGhosts + (grow > 1.2 ? 1 : 0) : 0,
+      timer: base.timer ? Math.round(base.timer * d.timer * Math.pow(grow, 1.6)) : 0,
+      fog: base.fog ? base.fog + d.fog : 0,
+      gates: base.gates ? Math.round(base.gates * Math.max(1, grow)) : 0,
+      gateScale: d.gate,
+      ghostSpeed: d.ghostSpeed * (base.speedUp || 1),
+      chase: d.chase,
+    };
+  }
+  function baseSpec(l) {
     if (l <= LEVELS.length) return LEVELS[l - 1];
     // Endless mode: random combos, capped size, faster ghosts
     const r = () => Math.random();
@@ -160,6 +219,7 @@
   }
 
   let spec, size, grid, pos, trail, goal, level = 1, lives = 3;
+  const startLives = () => DIFF[settings.diff].lives;
   let keys = [], ghosts = [], gates = [];
   let started = false, done = false, startTime = 0, elapsed = 0, invulnUntil = 0;
   let dragging = false, lastPt = null, px = 0, now = 0;
@@ -272,7 +332,7 @@
       spots.sort(() => Math.random() - .5);
       spots.slice(0, spec.gates).forEach(i => {
         const a = path[i - 1], b = path[i];
-        gates.push({ x: a.x, y: a.y, dx: b.x - a.x, dy: b.y - a.y, period: 2600 + rnd(1400), phase: rnd(4000) });
+        gates.push({ x: a.x, y: a.y, dx: b.x - a.x, dy: b.y - a.y, period: (2600 + rnd(1400)) * spec.gateScale, phase: rnd(4000) });
       });
     }
   }
@@ -288,7 +348,7 @@
     }
     for (let i = 0; i < (spec.ghosts || 0) && far.length; i++) {
       const c = far.splice(rnd(far.length), 1)[0];
-      ghosts.push({ x: c.x, y: c.y, fx: c.x, fy: c.y, tx: c.x, ty: c.y, speed: 1.7 * (spec.speedUp || 1) });
+      ghosts.push({ x: c.x, y: c.y, fx: c.x, fy: c.y, tx: c.x, ty: c.y, speed: spec.ghostSpeed });
     }
   }
 
@@ -300,7 +360,7 @@
       const fwd = opts.filter(o => !(o.x === g.fx && o.y === g.fy));
       if (fwd.length) opts = fwd;
       let pick = opts[rnd(opts.length)];
-      if (Math.random() < .35) pick = opts.reduce((p, o) =>
+      if (Math.random() < spec.chase) pick = opts.reduce((p, o) =>
         Math.hypot(o.x - pos.x, o.y - pos.y) < Math.hypot(p.x - pos.x, p.y - pos.y) ? o : p);
       g.fx = g.x; g.fy = g.y; g.tx = pick.x; g.ty = pick.y;
     }
@@ -502,7 +562,7 @@
   }
 
   function updateHud() {
-    $('lives').textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, Math.min(MAX_LIVES, 3) - lives));
+    $('lives').textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, startLives() - lives));
     const t = $('time');
     if (spec.timer) {
       const left = Math.max(0, spec.timer - (started ? elapsed : 0));
@@ -540,12 +600,13 @@
     document.body.classList.remove('dragging');
     let best = level;
     try {
-      best = Math.max(level, parseInt(localStorage.getItem('maze-best-level')) || 0);
-      localStorage.setItem('maze-best-level', best);
+      const k = 'maze-best-' + settings.diff + '-' + settings.size;
+      best = Math.max(level, parseInt(localStorage.getItem(k)) || 0);
+      localStorage.setItem(k, best);
     } catch (e) {}
     updateHud();
     showOverlay(reason === 'time' ? 'Out of time' : 'Caught', `You reached level ${level}. Best: level ${best}.`, 'Play again', true);
-    $('ovBtn').onclick = () => { level = 1; lives = 3; setupLevel(false); };
+    $('ovBtn').onclick = () => { level = 1; lives = startLives(); setupLevel(false); };
   }
 
   let lastFrame = performance.now();
@@ -590,12 +651,34 @@
     move(k[0] * c, k[1] * c);
   });
 
-  const fresh = () => { if (lives <= 0) { level = 1; lives = 3; return true; } };
-  $('newBtn').addEventListener('click', () => { fresh(); setupLevel(false); });
-  $('restartBtn').addEventListener('click', () => setupLevel(!fresh()));
+  const menu = $('menu');
+  const fresh = () => { if (lives <= 0) { level = 1; lives = startLives(); return true; } };
+  $('newBtn').addEventListener('click', () => { if (!menu.hidden) return; fresh(); setupLevel(false); });
+  $('restartBtn').addEventListener('click', () => { if (!menu.hidden) return; setupLevel(!fresh()); });
   window.addEventListener('resize', resize);
 
+  // Start menu
+  function syncMenu() {
+    [['diffSeg', 'diff'], ['sizeSeg', 'size']].forEach(([id, key]) =>
+      $(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === settings[key])));
+    let best = 0;
+    try { best = parseInt(localStorage.getItem('maze-best-' + settings.diff + '-' + settings.size)) || 0; } catch (e) {}
+    $('menuDesc').textContent = DIFF[settings.diff].desc + ' ' + SIZE_DESC[settings.size] + (best ? ` Best: level ${best}.` : '');
+  }
+  [['diffSeg', 'diff'], ['sizeSeg', 'size']].forEach(([id, key]) =>
+    $(id).addEventListener('click', e => { const b = e.target.closest('button'); if (b) { settings[key] = b.dataset.v; syncMenu(); } }));
+  function openMenu() { done = true; dragging = false; $('overlay').hidden = true; menu.hidden = false; syncMenu(); $('startBtn').focus(); }
+  $('menuBtn').addEventListener('click', openMenu);
+  $('startBtn').addEventListener('click', () => {
+    try { localStorage.setItem('maze-settings', JSON.stringify(settings)); } catch (e) {}
+    menu.hidden = true;
+    level = 1; lives = startLives();
+    setupLevel(false);
+  });
+
+  lives = startLives();
   setupLevel(false);
+  openMenu();
   resize();
   document.fonts && document.fonts.ready.then(resize);
   requestAnimationFrame(frame);
