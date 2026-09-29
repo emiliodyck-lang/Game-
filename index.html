@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0f1220">
+<title>Maze Trace</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bungee&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  /* Layout: one column, board centered, stats above, controls below. Single committed dark look. */
+  :root {
+    --ink: #0f1220;
+    --board: #171b2c;
+    --wall: #c8cfe4;
+    --trail: #ffb347;
+    --goal: #6fd3c7;
+    --muted: #7d86a3;
+    --display: "Bungee", "Impact", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--ink);
+    color: var(--wall);
+    font-family: var(--mono);
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+  }
+  .wrap {
+    height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px;
+    padding-inline: 16px;
+    padding-block: calc(12px + env(safe-area-inset-top, 0px)) calc(12px + env(safe-area-inset-bottom, 0px));
+    box-sizing: border-box;
+    touch-action: none;
+  }
+  header {
+    width: 100%; max-width: 560px;
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  h1 { font-family: var(--display); font-weight: 400; font-size: 1.7rem; margin: 0; color: var(--trail); letter-spacing: .02em; }
+  .stats { display: flex; gap: 16px; font-variant-numeric: tabular-nums; font-size: .95rem; }
+  .stats b { color: var(--goal); font-weight: 600; }
+  .stage { position: relative; width: 100%; max-width: min(560px, calc(100vh - 220px)); }
+  canvas {
+    display: block; width: 100%; aspect-ratio: 1; max-width: 100%;
+    background: var(--board); border-radius: 10px;
+  }
+  .dragging { cursor: grabbing; }
+  .hint { width: 100%; max-width: 560px; margin: 0; color: var(--muted); font-size: .85rem; text-align: center; min-height: 1.3em; }
+  .controls { display: flex; gap: 10px; }
+  button {
+    font: 600 .95rem var(--mono);
+    background: transparent; color: var(--wall);
+    border: 1.5px solid var(--muted); border-radius: 8px;
+    padding: 10px 16px; cursor: pointer;
+    touch-action: manipulation;
+  }
+  button:hover { border-color: var(--wall); }
+  button:focus-visible { outline: 2px solid var(--goal); outline-offset: 2px; }
+  button.primary { background: var(--trail); color: var(--ink); border-color: var(--trail); }
+  .win {
+    position: absolute; inset: 0; border-radius: 10px;
+    background: color-mix(in srgb, var(--ink) 82%, transparent);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    text-align: center; padding: 16px;
+  }
+  .win[hidden] { display: none; }
+  .win h2 { font-family: var(--display); font-weight: 400; font-size: 2.2rem; margin: 0; color: var(--goal); }
+  .win p { margin: 0; font-size: 1rem; }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <header>
+    <h1>Maze Trace</h1>
+    <div class="stats">
+      <span>Level <b id="lvl">1</b></span>
+      <span>Time <b id="time">0.0</b>s</span>
+    </div>
+  </header>
+  <div class="stage">
+    <canvas id="board" aria-label="Maze board. Drag anywhere to steer the orange dot to the teal ring."></canvas>
+    <div class="win" id="win" hidden>
+      <h2>Escaped</h2>
+      <p id="winText"></p>
+      <button class="primary" id="nextBtn">Next maze</button>
+    </div>
+  </div>
+  <p class="hint" id="hint">Drag anywhere on the screen. The dot follows your finger and slides around corners.</p>
+  <div class="controls">
+    <button id="restartBtn">Restart</button>
+    <button id="newBtn">New maze</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('board');
+  const ctx = cv.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const C = { wall: css('--wall'), trail: css('--trail'), goal: css('--goal') };
+
+  // How far the dot moves per pixel of finger movement (1 = same distance as your finger).
+  const SENSITIVITY = 1.15;
+  const PAD = 10;
+
+  // Wall bits per cell
+  const N = 1, E = 2, S = 4, W = 8;
+  const DIRS = [[0,-1,N,S],[1,0,E,W],[0,1,S,N],[-1,0,W,E]];
+
+  let size, grid, pos, trail, goal, level = 1, startTime = 0, elapsed = 0, timerOn = false, done = false;
+  let dragging = false, lastPt = null, px = 0;
+
+  function makeMaze(n) {
+    const g = Array.from({ length: n }, () => Array(n).fill(15));
+    const seen = Array.from({ length: n }, () => Array(n).fill(false));
+    const stack = [[0, 0]];
+    seen[0][0] = true;
+    while (stack.length) {
+      const [x, y] = stack[stack.length - 1];
+      const opts = DIRS.filter(([dx, dy]) => {
+        const nx = x + dx, ny = y + dy;
+        return nx >= 0 && ny >= 0 && nx < n && ny < n && !seen[ny][nx];
+      });
+      if (!opts.length) { stack.pop(); continue; }
+      const [dx, dy, b, ob] = opts[Math.floor(Math.random() * opts.length)];
+      const nx = x + dx, ny = y + dy;
+      g[y][x] &= ~b; g[ny][nx] &= ~ob;
+      seen[ny][nx] = true;
+      stack.push([nx, ny]);
+    }
+    return g;
+  }
+
+  function newLevel(keepMaze) {
+    size = Math.min(6 + (level - 1) * 2, 26);
+    if (!keepMaze) grid = makeMaze(size);
+    pos = { x: 0, y: 0 };
+    goal = { x: size - 1, y: size - 1 };
+    trail = [{ x: 0, y: 0 }];
+    elapsed = 0; timerOn = false; done = false;
+    $('lvl').textContent = level;
+    $('time').textContent = '0.0';
+    $('win').hidden = true;
+    draw();
+  }
+
+  function cellPx() { return (px - PAD * 2) / size; }
+
+  function resize() {
+    const r = cv.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(r.width * dpr);
+    cv.height = Math.round(r.width * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    px = r.width;
+    draw();
+  }
+
+  function draw() {
+    if (!grid || !px) return;
+    const cell = cellPx();
+    const cx = v => PAD + (v + 0.5) * cell;
+    ctx.clearRect(0, 0, px, px);
+
+    // goal ring
+    ctx.strokeStyle = C.goal; ctx.lineWidth = Math.max(2, cell * 0.12);
+    ctx.beginPath(); ctx.arc(cx(goal.x), cx(goal.y), cell * 0.28, 0, Math.PI * 2); ctx.stroke();
+
+    // trail: visited path plus the partial segment up to the dot
+    ctx.strokeStyle = C.trail; ctx.globalAlpha = 0.5;
+    ctx.lineWidth = cell * 0.32; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    trail.forEach((p, i) => i ? ctx.lineTo(cx(p.x), cx(p.y)) : ctx.moveTo(cx(p.x), cx(p.y)));
+    ctx.lineTo(cx(pos.x), cx(pos.y));
+    ctx.stroke(); ctx.globalAlpha = 1;
+
+    // walls
+    ctx.strokeStyle = C.wall; ctx.lineWidth = Math.max(2, cell * 0.1); ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const v = grid[y][x], X = PAD + x * cell, Y = PAD + y * cell;
+      if (v & N) { ctx.moveTo(X, Y); ctx.lineTo(X + cell, Y); }
+      if (v & W) { ctx.moveTo(X, Y); ctx.lineTo(X, Y + cell); }
+      if (y === size - 1 && v & S) { ctx.moveTo(X, Y + cell); ctx.lineTo(X + cell, Y + cell); }
+      if (x === size - 1 && v & E) { ctx.moveTo(X + cell, Y); ctx.lineTo(X + cell, Y + cell); }
+    }
+    ctx.stroke();
+
+    // player
+    ctx.fillStyle = C.trail;
+    ctx.shadowColor = C.trail; ctx.shadowBlur = dragging ? 18 : 8;
+    ctx.beginPath(); ctx.arc(cx(pos.x), cx(pos.y), cell * 0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // Is there an opening from cell (x,y) in direction (dx,dy)?
+  function isOpen(x, y, dx, dy) {
+    const d = DIRS.find(d => d[0] === dx && d[1] === dy);
+    return d && !(grid[y][x] & d[2]);
+  }
+
+  // The dot rides on rails between cell centres. Each call moves it a tiny amount.
+  // If your finger points into a wall, it uses that motion to slide toward the
+  // nearest turn that goes your way, so you never get stuck on a corner.
+  function step(mx, my) {
+    const len = Math.hypot(mx, my);
+    if (!len) return;
+    const rx = Math.round(pos.x), ry = Math.round(pos.y);
+    const onX = Math.abs(pos.x - rx) < 1e-9, onY = Math.abs(pos.y - ry) < 1e-9;
+    const sx = Math.sign(mx), sy = Math.sign(my);
+    const horizFirst = Math.abs(mx) >= Math.abs(my);
+
+    if (onX && onY) {
+      pos.x = rx; pos.y = ry;
+      const tries = horizFirst ? [[sx, 0], [0, sy]] : [[0, sy], [sx, 0]];
+      for (const [dx, dy] of tries) {
+        if ((dx || dy) && isOpen(rx, ry, dx, dy)) { pos.x += dx * len; pos.y += dy * len; return; }
+      }
+      return;
+    }
+
+    if (onY) { // on a horizontal corridor between two centres
+      pos.y = ry;
+      const a = Math.floor(pos.x), b = a + 1;
+      let target = null;
+      if (horizFirst) target = sx > 0 ? b : a;
+      else {
+        const ok = [a, b].filter(n => isOpen(n, ry, 0, sy));
+        if (ok.length) target = ok.reduce((p, n) => Math.abs(n - pos.x) < Math.abs(p - pos.x) ? n : p);
+        else if (sx) target = sx > 0 ? b : a;
+      }
+      if (target === null) return;
+      pos.x = Math.abs(target - pos.x) <= len ? target : pos.x + Math.sign(target - pos.x) * len;
+      return;
+    }
+
+    if (onX) { // on a vertical corridor
+      pos.x = rx;
+      const a = Math.floor(pos.y), b = a + 1;
+      let target = null;
+      if (!horizFirst) target = sy > 0 ? b : a;
+      else {
+        const ok = [a, b].filter(n => isOpen(rx, n, sx, 0));
+        if (ok.length) target = ok.reduce((p, n) => Math.abs(n - pos.y) < Math.abs(p - pos.y) ? n : p);
+        else if (sy) target = sy > 0 ? b : a;
+      }
+      if (target === null) return;
+      pos.y = Math.abs(target - pos.y) <= len ? target : pos.y + Math.sign(target - pos.y) * len;
+    }
+  }
+
+  function arrived() {
+    if (!Number.isInteger(pos.x) || !Number.isInteger(pos.y)) return;
+    const last = trail[trail.length - 1];
+    if (last.x === pos.x && last.y === pos.y) return;
+    const prev = trail[trail.length - 2];
+    if (prev && prev.x === pos.x && prev.y === pos.y) trail.pop(); // backtracking erases trail
+    else trail.push({ x: pos.x, y: pos.y });
+    if (pos.x === goal.x && pos.y === goal.y) win();
+  }
+
+  function move(dxPx, dyPx) {
+    const cell = cellPx();
+    let mx = dxPx / cell * SENSITIVITY, my = dyPx / cell * SENSITIVITY;
+    const n = Math.max(1, Math.ceil(Math.hypot(mx, my) / 0.04));
+    mx /= n; my /= n;
+    for (let i = 0; i < n && !done; i++) { step(mx, my); arrived(); }
+    if (!timerOn && !done && (pos.x || pos.y)) {
+      timerOn = true; startTime = performance.now(); requestAnimationFrame(tick);
+    }
+  }
+
+  function tick() {
+    if (!timerOn) return;
+    elapsed = (performance.now() - startTime) / 1000;
+    $('time').textContent = elapsed.toFixed(1);
+    requestAnimationFrame(tick);
+  }
+
+  function win() {
+    timerOn = false; done = true; dragging = false;
+    document.body.classList.remove('dragging');
+    let best = null;
+    try {
+      const k = 'maze-best-' + size;
+      best = parseFloat(localStorage.getItem(k));
+      if (!best || elapsed < best) { localStorage.setItem(k, elapsed); best = elapsed; }
+    } catch (e) {}
+    $('winText').textContent = `Level ${level} in ${elapsed.toFixed(1)}s` + (best ? ` · best ${best.toFixed(1)}s` : '');
+    $('win').hidden = false;
+    $('nextBtn').focus();
+  }
+
+  // Drag anywhere on the page (not just on the dot), so your finger never hides the maze.
+  const wrap = $('wrap');
+  wrap.addEventListener('pointerdown', e => {
+    if (done || e.target.closest('button')) return;
+    e.preventDefault();
+    dragging = true; lastPt = { x: e.clientX, y: e.clientY };
+    wrap.setPointerCapture(e.pointerId);
+    document.body.classList.add('dragging');
+    draw();
+  });
+
+  wrap.addEventListener('pointermove', e => {
+    if (!dragging || done) return;
+    move(e.clientX - lastPt.x, e.clientY - lastPt.y);
+    lastPt = { x: e.clientX, y: e.clientY };
+    draw();
+  });
+
+  const release = () => { if (!dragging) return; dragging = false; document.body.classList.remove('dragging'); draw(); };
+  wrap.addEventListener('pointerup', release);
+  wrap.addEventListener('pointercancel', release);
+
+  // Arrow keys / WASD for desktop
+  const KEYS = { ArrowUp: [0,-1], ArrowDown: [0,1], ArrowLeft: [-1,0], ArrowRight: [1,0], w: [0,-1], s: [0,1], a: [-1,0], d: [1,0] };
+  window.addEventListener('keydown', e => {
+    const k = KEYS[e.key]; if (!k || done) return;
+    e.preventDefault();
+    const c = cellPx() / SENSITIVITY / 3;
+    move(k[0] * c, k[1] * c); draw();
+  });
+
+  $('nextBtn').addEventListener('click', () => { level++; newLevel(false); });
+  $('newBtn').addEventListener('click', () => newLevel(false));
+  $('restartBtn').addEventListener('click', () => newLevel(true));
+  window.addEventListener('resize', resize);
+
+  newLevel(false);
+  resize();
+  document.fonts && document.fonts.ready.then(resize);
+})();
+</script>
+</body>
+</html>
